@@ -4,7 +4,7 @@ use cherry::github::webhook::webhook;
 use std::env;
 use std::io;
 
-use actix_web::{web, App, HttpServer};
+use actix_web::{middleware::Logger, web, App, HttpServer};
 use jsonwebtoken::EncodingKey;
 use log::info;
 
@@ -25,8 +25,12 @@ async fn main() -> io::Result<()> {
   let bind_address = "127.0.0.1:8088";
 
   info!("listening on {}", bind_address);
-  HttpServer::new(|| App::new().route("/webhook", web::post().to(webhook)))
-    .bind(bind_address)?
-    .run()
-    .await
+  HttpServer::new(|| {
+    App::new()
+      .wrap(Logger::default())
+      .route("/webhook", web::post().to(webhook))
+  })
+  .bind(bind_address)?
+  .run()
+  .await
 }
