@@ -25,7 +25,7 @@ async fn main() -> io::Result<()> {
     }
   };
 
-  let bind_address = "127.0.0.1:8088";
+  let bind_address = env::var("BIND_ADDRESS").unwrap_or("127.0.0.1:8080".to_string());
 
   info!("listening on {}", bind_address);
   HttpServer::new(move || {

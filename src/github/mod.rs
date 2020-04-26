@@ -31,7 +31,8 @@ impl Context for CommandContext {
       .unwrap(); // FIXME
     let mut response = self
       .client
-      .app_request(Method::POST, uri)
+      .repo_request(self.repository.clone(), Method::POST, uri)
+      .await
       .unwrap() // FIXME
       .send_json(&json!({
         "body": message,
