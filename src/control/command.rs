@@ -1,14 +1,15 @@
 use thiserror::Error;
-
-#[derive(Debug)]
-struct CommandComment {
-  commands: Vec<Command>,
-}
+use async_trait::async_trait;
 
 #[derive(Debug, Error)]
 pub enum ParseError {
   #[error("unknown command: {0}")]
   UnknownCommand(String),
+}
+
+#[async_trait(?Send)]
+pub trait Context {
+  async fn reply(&mut self, message: String);
 }
 
 #[derive(Debug)]
@@ -26,9 +27,19 @@ impl Command {
         }
         Some(match words.next() {
           Some("ping") => Ok(Self::Ping),
-          other => Err(ParseError::UnknownCommand(other.unwrap_or("[none]").to_string())),
+          other => Err(ParseError::UnknownCommand(
+            other.unwrap_or("[none]").to_string(),
+          )),
         })
       })
       .collect()
+  }
+
+  pub async fn run(self, context: &mut impl Context) {
+    match self {
+      Self::Ping => {
+        context.reply("pong!".to_string()).await;
+      }
+    }
   }
 }

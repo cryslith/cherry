@@ -1,3 +1,6 @@
+use crate::github::client::Credentials;
+
+use actix_rt::spawn;
 use actix_web::{error, http::StatusCode, web, HttpRequest, HttpResponse};
 use log::trace;
 use serde_json::from_slice;
@@ -37,15 +40,19 @@ impl WebhookRequest {
     }
   }
 
-  async fn handle(self) -> Result<HttpResponse, WebhookError> {
+  async fn handle(self, credentials: Credentials) {
     match self {
-      Self::IssueComment(d) => issue_comment::handle(d).await,
-      Self::Unknown => Ok(HttpResponse::Accepted().finish()),
+      Self::IssueComment(d) => issue_comment::handle(d, credentials).await,
+      Self::Unknown => {}
     }
   }
 }
 
-pub async fn webhook(request: HttpRequest, body: web::Bytes) -> Result<HttpResponse, WebhookError> {
+pub async fn webhook(
+  request: HttpRequest,
+  body: web::Bytes,
+  credentials: web::Data<Credentials>,
+) -> Result<HttpResponse, WebhookError> {
   let headers = request.headers();
   let event_type = headers
     .get("X-GitHub-Event")
@@ -54,7 +61,9 @@ pub async fn webhook(request: HttpRequest, body: web::Bytes) -> Result<HttpRespo
     .map_err(|_| WebhookError::InvalidEventType)?;
 
   trace!("received webhook: {:?}", event_type);
-  WebhookRequest::parse(event_type, &body)?.handle().await
+  let request = WebhookRequest::parse(event_type, &body)?;
+  spawn(request.handle(credentials.as_ref().clone()));
+  Ok(HttpResponse::Accepted().finish())
 }
 
 #[cfg(test)]
@@ -65,11 +74,13 @@ mod tests {
   fn test_webhook_parse() {
     use WebhookRequest::*;
     {
+      use crate::github::client::Repository;
       use issue_comment::*;
       assert_eq!(
         IssueComment(T {
           action: Action::Created,
           issue: Issue {
+            number: 1,
             state: State::Open,
             pull_request: None,
           },
@@ -78,6 +89,11 @@ mod tests {
               login: "Codertocat".to_string(),
             },
             body: "You are totally right! I'll get this fixed right away.".to_string(),
+          },
+          repository: Repository {
+            id: 186853002,
+            owner: "Codertocat".to_string(),
+            repo: "Hello-World".to_string(),
           }
         }),
         WebhookRequest::parse(
@@ -92,10 +108,11 @@ mod tests {
 }
 
 mod issue_comment {
-  use super::WebhookError;
   use crate::control::command::Command;
+  use crate::github::client::{Client, Credentials, Repository};
+  use crate::github::CommandContext;
 
-  use actix_web::HttpResponse;
+  use actix_web::client::Client as AwcClient;
   use log::{error, info};
   use serde::Deserialize;
 
@@ -121,6 +138,7 @@ mod issue_comment {
   pub(super) struct Issue {
     pub state: State,
     pub pull_request: Option<PullRequest>,
+    pub number: i64,
   }
 
   #[derive(Debug, Deserialize, PartialEq)]
@@ -139,13 +157,14 @@ mod issue_comment {
     pub action: Action,
     pub issue: Issue,
     pub comment: Comment,
+    pub repository: Repository,
   }
 
-  pub(super) async fn handle(data: T) -> Result<HttpResponse, WebhookError> {
+  pub(super) async fn handle(data: T, credentials: Credentials) {
     match data.action {
       Action::Created => {}
       _ => {
-        return Ok(HttpResponse::Accepted().finish());
+        return;
       }
     }
     let commands = match Command::parse_comment(&data.comment.body[..]) {
@@ -153,13 +172,20 @@ mod issue_comment {
       Err(e) => {
         error!("failed to parse comment: {:?}", e);
         // TODO send error message to user
-        return Ok(HttpResponse::Ok().finish());
+        return;
       }
     };
     if commands.is_empty() {
-      return Ok(HttpResponse::Accepted().finish());
+      return;
     }
     info!("received commands: {:?}", commands);
-    return Ok(HttpResponse::Ok().finish());
+    let mut context = CommandContext {
+      client: Client::new(credentials.clone(), AwcClient::new()),
+      repository: data.repository,
+      issue_number: data.issue.number,
+    };
+    for command in commands {
+      command.run(&mut context).await; // TODO error handling
+    }
   }
 }
