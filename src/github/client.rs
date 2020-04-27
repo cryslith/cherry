@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use actix_web::client::{Client as AwcClient, ClientRequest, ClientResponse, PayloadError};
 use actix_web::http::{header, uri, Method, StatusCode};
@@ -10,6 +11,7 @@ use futures::prelude::Stream;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 const APP_TOKEN_LIFESPAN_SECS: i64 = 10 * 60;
 const APP_TOKEN_RENEW_AHEAD_SECS: i64 = 30;
@@ -59,6 +61,7 @@ struct Claims {
   iss: String,
 }
 
+#[derive(Clone)]
 struct Token {
   token: String,
   renew: DateTime<Utc>,
@@ -170,24 +173,7 @@ pub struct Credentials {
   pub private_key: EncodingKey,
 }
 
-pub struct Client {
-  credentials: Credentials,
-  app_token_cache: Option<Token>,
-  installation_tokens: HashMap<Repository, Token>,
-  client: AwcClient,
-}
-
-impl Client {
-  // FIXME need to share credential cache across requests
-  pub fn new(credentials: Credentials, client: AwcClient) -> Self {
-    Self {
-      credentials,
-      app_token_cache: None,
-      installation_tokens: HashMap::new(),
-      client,
-    }
-  }
-
+impl Credentials {
   fn generate_app_token(&self) -> Result<Token, ClientError> {
     let iat = Utc::now();
     let exp = iat + Duration::seconds(APP_TOKEN_LIFESPAN_SECS);
@@ -197,20 +183,62 @@ impl Client {
         &Claims {
           iat,
           exp,
-          iss: self.credentials.app_id.clone(),
+          iss: self.app_id.clone(),
         },
-        &self.credentials.private_key,
+        &self.private_key,
       )?,
       renew: exp - Duration::seconds(APP_TOKEN_RENEW_AHEAD_SECS),
     })
   }
+}
 
-  fn app_token(&mut self) -> Result<&Token, ClientError> {
-    let token = match self.app_token_cache.take() {
-      Some(token) if Utc::now() < token.renew => token,
-      _ => self.generate_app_token()?,
-    };
-    Ok(self.app_token_cache.get_or_insert(token))
+pub struct TokenCache {
+  app_token: Option<Token>,
+  installation_tokens: HashMap<Repository, Token>,
+}
+
+impl TokenCache {
+  pub fn new() -> Self {
+    Self {
+      app_token: None,
+      installation_tokens: HashMap::new(),
+    }
+  }
+
+  fn app_token(&mut self, credentials: &Credentials) -> Result<Token, ClientError> {
+    match &self.app_token {
+      Some(token) if Utc::now() < token.renew => Ok(token.clone()),
+      _ => {
+        let token = credentials.generate_app_token()?;
+        self.app_token = Some(token.clone());
+        Ok(token)
+      }
+    }
+  }
+}
+
+pub struct Client {
+  credentials: Credentials,
+  // TODO use a resource pool to avoid contending on the cache
+  token_cache: Arc<Mutex<TokenCache>>,
+  client: AwcClient,
+}
+
+impl Client {
+  pub fn new(
+    credentials: Credentials,
+    token_cache: Arc<Mutex<TokenCache>>,
+    client: AwcClient,
+  ) -> Self {
+    Self {
+      credentials,
+      token_cache,
+      client,
+    }
+  }
+
+  async fn app_token(&self) -> Result<Token, ClientError> {
+    self.token_cache.lock().await.app_token(&self.credentials)
   }
 
   pub async fn response_ok<S>(response: &mut ClientResponse<S>) -> Result<(), ClientError>
@@ -242,10 +270,7 @@ impl Client {
         .api()
         .path_and_query(format!("/repos/{}/installation", repo).as_str())
         .build()?;
-      let mut response = self
-        .app_request(Method::GET, uri)?
-        .send()
-        .await?;
+      let mut response = self.app_request(Method::GET, uri).await?.send().await?;
       Self::response_ok(&mut response).await?;
       response
         .json()
@@ -258,7 +283,8 @@ impl Client {
         .path_and_query(format!("/app/installations/{}/access_tokens", installation.id).as_str())
         .build()?;
       let mut response = self
-        .app_request(Method::POST, uri)?
+        .app_request(Method::POST, uri)
+        .await?
         .send_json(&TokenRequest {
           repository_ids: vec![repo.id],
           permissions: [(PermissionType::Issues, Permission::Write)]
@@ -279,12 +305,27 @@ impl Client {
     })
   }
 
-  async fn repo_token(&mut self, repo: Repository) -> Result<&Token, ClientError> {
-    let token = match self.installation_tokens.remove(&repo) {
-      Some(token) if Utc::now() < token.renew => token,
-      _ => self.request_repo_token(&repo).await?,
-    };
-    Ok(self.installation_tokens.entry(repo).or_insert(token))
+  async fn repo_token(&mut self, repo: Repository) -> Result<Token, ClientError> {
+    let maybe_token = self
+      .token_cache
+      .lock()
+      .await
+      .installation_tokens
+      .get(&repo)
+      .cloned();
+    match maybe_token {
+      Some(token) if Utc::now() < token.renew => Ok(token),
+      _ => {
+        let token = self.request_repo_token(&repo).await?;
+        self
+          .token_cache
+          .lock()
+          .await
+          .installation_tokens
+          .insert(repo, token.clone());
+        Ok(token)
+      }
+    }
   }
 
   pub fn api(&self) -> uri::Builder {
@@ -304,14 +345,14 @@ impl Client {
       .set_header(header::USER_AGENT, "cryslith/cherry")
   }
 
-  pub fn app_request(
+  pub async fn app_request(
     &mut self,
     method: Method,
     uri: uri::Uri,
   ) -> Result<ClientRequest, ClientError> {
     Ok(self.api_request(method, uri).set_header(
       header::AUTHORIZATION,
-      format!("Bearer {}", self.app_token()?.token),
+      format!("Bearer {}", self.app_token().await?.token),
     ))
   }
 

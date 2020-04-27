@@ -1,10 +1,13 @@
-use crate::github::client::Credentials;
+use crate::github::client::{Credentials, TokenCache};
+
+use std::sync::Arc;
 
 use actix_rt::spawn;
 use actix_web::{error, http::StatusCode, web, HttpRequest, HttpResponse};
 use log::trace;
 use serde_json::from_slice;
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 #[derive(Debug, Error)]
 pub enum WebhookError {
@@ -40,9 +43,9 @@ impl WebhookRequest {
     }
   }
 
-  async fn handle(self, credentials: Credentials) {
+  async fn handle(self, credentials: Credentials, token_cache: Arc<Mutex<TokenCache>>) {
     match self {
-      Self::IssueComment(d) => issue_comment::handle(d, credentials).await,
+      Self::IssueComment(d) => issue_comment::handle(d, credentials, token_cache).await,
       Self::Unknown => {}
     }
   }
@@ -52,6 +55,7 @@ pub async fn webhook(
   request: HttpRequest,
   body: web::Bytes,
   credentials: web::Data<Credentials>,
+  token_cache: web::Data<Arc<Mutex<TokenCache>>>,
 ) -> Result<HttpResponse, WebhookError> {
   let headers = request.headers();
   let event_type = headers
@@ -62,7 +66,7 @@ pub async fn webhook(
 
   trace!("received webhook: {:?}", event_type);
   let request = WebhookRequest::parse(event_type, &body)?;
-  spawn(request.handle(credentials.as_ref().clone()));
+  spawn(request.handle(credentials.as_ref().clone(), token_cache.as_ref().clone()));
   Ok(HttpResponse::Accepted().finish())
 }
 
@@ -109,12 +113,15 @@ mod tests {
 
 mod issue_comment {
   use crate::control::command::{Command, Context};
-  use crate::github::client::{Client, Credentials, Repository};
+  use crate::github::client::{Client, Credentials, Repository, TokenCache};
   use crate::github::CommandContext;
+
+  use std::sync::Arc;
 
   use actix_web::client::Client as AwcClient;
   use log::{error, info};
   use serde::Deserialize;
+  use tokio::sync::Mutex;
 
   #[derive(Debug, Deserialize, PartialEq)]
   #[serde(rename_all = "snake_case")]
@@ -160,7 +167,11 @@ mod issue_comment {
     pub repository: Repository,
   }
 
-  pub(super) async fn handle(data: T, credentials: Credentials) {
+  pub(super) async fn handle(
+    data: T,
+    credentials: Credentials,
+    token_cache: Arc<Mutex<TokenCache>>,
+  ) {
     match data.action {
       Action::Created => {}
       _ => {
@@ -168,7 +179,7 @@ mod issue_comment {
       }
     }
     let mut context = CommandContext {
-      client: Client::new(credentials.clone(), AwcClient::new()),
+      client: Client::new(credentials, token_cache, AwcClient::new()),
       repository: data.repository,
       issue_number: data.issue.number,
     };
