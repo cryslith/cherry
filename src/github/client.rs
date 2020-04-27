@@ -44,6 +44,12 @@ pub enum ClientError {
   ServerErrorResponse(StatusCode, Result<ServerError, String>),
 }
 
+impl From<actix_web::client::SendRequestError> for ClientError {
+  fn from(e: actix_web::client::SendRequestError) -> Self {
+    Self::SendRequest(e)
+  }
+}
+
 #[derive(Debug, Serialize)]
 struct Claims {
   #[serde(with = "ts_seconds")]
@@ -239,8 +245,7 @@ impl Client {
       let mut response = self
         .app_request(Method::GET, uri)?
         .send()
-        .await
-        .map_err(|e| ClientError::SendRequest(e))?;
+        .await?;
       Self::response_ok(&mut response).await?;
       response
         .json()
@@ -261,8 +266,7 @@ impl Client {
             .copied()
             .collect(),
         })
-        .await
-        .map_err(|e| ClientError::SendRequest(e))?;
+        .await?;
       Self::response_ok(&mut response).await?;
       response
         .json()

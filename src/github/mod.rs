@@ -1,12 +1,19 @@
 use crate::control::command::Context;
-use client::{Client, Repository};
+use client::{Client, ClientError, Repository};
 
 use actix_web::http::Method;
 use async_trait::async_trait;
 use serde_json::json;
+use thiserror::Error;
 
 pub mod client;
 pub mod webhook;
+
+#[derive(Debug, Error)]
+pub enum CommandError {
+  #[error("client operation")]
+  Client(#[from] ClientError),
+}
 
 pub struct CommandContext {
   client: Client,
@@ -16,7 +23,9 @@ pub struct CommandContext {
 
 #[async_trait(?Send)]
 impl Context for CommandContext {
-  async fn reply(&mut self, message: String) {
+  type Error = CommandError;
+
+  async fn reply(&mut self, message: String) -> Result<(), Self::Error> {
     let uri = self
       .client
       .api()
@@ -28,17 +37,17 @@ impl Context for CommandContext {
         .as_str(),
       )
       .build()
-      .unwrap(); // FIXME
+      .map_err::<ClientError, _>(Into::into)?;
     let mut response = self
       .client
       .repo_request(self.repository.clone(), Method::POST, uri)
-      .await
-      .unwrap() // FIXME
+      .await?
       .send_json(&json!({
         "body": message,
       }))
       .await
-      .unwrap(); // FIXME
-    Client::response_ok(&mut response).await.unwrap(); // FIXME
+      .map_err::<ClientError, _>(Into::into)?;
+    Client::response_ok(&mut response).await?;
+    Ok(())
   }
 }

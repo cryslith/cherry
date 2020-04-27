@@ -108,7 +108,7 @@ mod tests {
 }
 
 mod issue_comment {
-  use crate::control::command::Command;
+  use crate::control::command::{Command, Context};
   use crate::github::client::{Client, Credentials, Repository};
   use crate::github::CommandContext;
 
@@ -167,11 +167,21 @@ mod issue_comment {
         return;
       }
     }
+    let mut context = CommandContext {
+      client: Client::new(credentials.clone(), AwcClient::new()),
+      repository: data.repository,
+      issue_number: data.issue.number,
+    };
     let commands = match Command::parse_comment(&data.comment.body[..]) {
       Ok(commands) => commands,
       Err(e) => {
-        error!("failed to parse comment: {:?}", e);
-        // TODO send error message to user
+        let error_message = format!("Error: {}", e);
+        match context.reply(error_message).await {
+          Ok(()) => {}
+          Err(e) => {
+            error!("sending error message: {}", e);
+          }
+        }
         return;
       }
     };
@@ -179,13 +189,20 @@ mod issue_comment {
       return;
     }
     info!("received commands: {:?}", commands);
-    let mut context = CommandContext {
-      client: Client::new(credentials.clone(), AwcClient::new()),
-      repository: data.repository,
-      issue_number: data.issue.number,
-    };
     for command in commands {
-      command.run(&mut context).await; // TODO error handling
+      match command.run(&mut context).await {
+        Ok(_) => {}
+        Err(e) => {
+          let error_message = format!("Error running command: {}: {}", command, e,);
+          match context.reply(error_message).await {
+            Ok(()) => {}
+            Err(e) => {
+              error!("sending error message: {}", e);
+            }
+          }
+          return;
+        }
+      }
     }
   }
 }

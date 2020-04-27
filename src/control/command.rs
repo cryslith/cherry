@@ -1,5 +1,7 @@
-use thiserror::Error;
+use std::fmt;
+
 use async_trait::async_trait;
+use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ParseError {
@@ -9,12 +11,22 @@ pub enum ParseError {
 
 #[async_trait(?Send)]
 pub trait Context {
-  async fn reply(&mut self, message: String);
+  type Error;
+
+  async fn reply(&mut self, message: String) -> Result<(), Self::Error>;
 }
 
 #[derive(Debug)]
 pub enum Command {
   Ping,
+}
+
+impl fmt::Display for Command {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Ping => write!(f, "ping"),
+    }
+  }
 }
 
 impl Command {
@@ -35,11 +47,12 @@ impl Command {
       .collect()
   }
 
-  pub async fn run(self, context: &mut impl Context) {
+  pub async fn run<C>(&self, context: &mut C) -> Result<(), C::Error>
+  where
+    C: Context,
+  {
     match self {
-      Self::Ping => {
-        context.reply("pong!".to_string()).await;
-      }
+      Self::Ping => context.reply("pong!".to_string()).await,
     }
   }
 }
