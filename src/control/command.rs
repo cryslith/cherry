@@ -19,12 +19,14 @@ pub trait Context {
 #[derive(Debug)]
 pub enum Command {
   Ping,
+  Merge,
 }
 
 impl fmt::Display for Command {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
       Self::Ping => write!(f, "ping"),
+      Self::Merge => write!(f, "merge"),
     }
   }
 }
@@ -39,6 +41,7 @@ impl Command {
         }
         Some(match words.next() {
           Some("ping") => Ok(Self::Ping),
+          Some("merge") | Some("r+") => Ok(Self::Merge),
           other => Err(ParseError::UnknownCommand(
             other.unwrap_or("[none]").to_string(),
           )),
@@ -53,6 +56,7 @@ impl Command {
   {
     match self {
       Self::Ping => context.reply("pong!".to_string()).await,
+      Self::Merge => unimplemented!(),
     }
   }
 }

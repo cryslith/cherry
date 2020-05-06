@@ -1,5 +1,6 @@
+use crate::github::types::{PullRequest, Repository};
+
 use std::collections::HashMap;
-use std::fmt;
 use std::sync::Arc;
 
 use actix_web::client::{Client as AwcClient, ClientRequest, ClientResponse, PayloadError};
@@ -9,7 +10,8 @@ use chrono::serde::ts_seconds;
 use chrono::{DateTime, Duration, Utc};
 use futures::prelude::Stream;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -65,44 +67,6 @@ struct Claims {
 struct Token {
   token: String,
   renew: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Repository {
-  pub id: i64,
-  pub owner: String,
-  pub repo: String,
-}
-
-impl<'de> Deserialize<'de> for Repository {
-  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-  where
-    D: Deserializer<'de>,
-  {
-    #[derive(Deserialize)]
-    struct Owner {
-      login: String,
-    }
-    #[derive(Deserialize)]
-    struct ReceivedRepository {
-      id: i64,
-      owner: Owner,
-      name: String,
-    }
-    let ReceivedRepository { id, owner, name } = ReceivedRepository::deserialize(deserializer)?;
-
-    Ok(Repository {
-      id,
-      owner: owner.login,
-      repo: name,
-    })
-  }
-}
-
-impl fmt::Display for Repository {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    write!(f, "{}/{}", self.owner, self.repo)
-  }
 }
 
 #[derive(Debug, Deserialize)]
@@ -264,7 +228,7 @@ impl Client {
     ))
   }
 
-  async fn request_repo_token(&mut self, repo: &Repository) -> Result<Token, ClientError> {
+  async fn request_repo_token(&self, repo: &Repository) -> Result<Token, ClientError> {
     let installation: Installation = {
       let uri = self
         .api()
@@ -305,24 +269,24 @@ impl Client {
     })
   }
 
-  async fn repo_token(&mut self, repo: Repository) -> Result<Token, ClientError> {
+  async fn repo_token(&self, repo: &Repository) -> Result<Token, ClientError> {
     let maybe_token = self
       .token_cache
       .lock()
       .await
       .installation_tokens
-      .get(&repo)
+      .get(repo)
       .cloned();
     match maybe_token {
       Some(token) if Utc::now() < token.renew => Ok(token),
       _ => {
-        let token = self.request_repo_token(&repo).await?;
+        let token = self.request_repo_token(repo).await?;
         self
           .token_cache
           .lock()
           .await
           .installation_tokens
-          .insert(repo, token.clone());
+          .insert(repo.clone(), token.clone());
         Ok(token)
       }
     }
@@ -346,7 +310,7 @@ impl Client {
   }
 
   pub async fn app_request(
-    &mut self,
+    &self,
     method: Method,
     uri: uri::Uri,
   ) -> Result<ClientRequest, ClientError> {
@@ -357,8 +321,8 @@ impl Client {
   }
 
   pub async fn repo_request(
-    &mut self,
-    repo: Repository,
+    &self,
+    repo: &Repository,
     method: Method,
     uri: uri::Uri,
   ) -> Result<ClientRequest, ClientError> {
@@ -366,5 +330,47 @@ impl Client {
       header::AUTHORIZATION,
       format!("Bearer {}", self.repo_token(repo).await?.token),
     ))
+  }
+
+  pub async fn comment_on_pr(
+    &self,
+    repo: &Repository,
+    pr_number: i64,
+    message: &str,
+  ) -> Result<(), ClientError> {
+    let uri = self
+      .api()
+      .path_and_query(format!("/repos/{}/issues/{}/comments", repo, pr_number).as_str())
+      .build()?;
+    let mut response = self
+      .repo_request(repo, Method::POST, uri)
+      .await?
+      .send_json(&json!({
+        "body": message,
+      }))
+      .await?;
+    Self::response_ok(&mut response).await?;
+    Ok(())
+  }
+
+  pub async fn pr_info(
+    &self,
+    repo: &Repository,
+    pr_number: i64,
+  ) -> Result<PullRequest, ClientError> {
+    let uri = self
+      .api()
+      .path_and_query(format!("/repos/{}/pulls/{}", repo, pr_number).as_str())
+      .build()?;
+    let mut response = self
+      .repo_request(repo, Method::GET, uri)
+      .await?
+      .send()
+      .await?;
+    Self::response_ok(&mut response).await?;
+    response
+      .json()
+      .await
+      .map_err(|_| ClientError::JsonPayload)
   }
 }
