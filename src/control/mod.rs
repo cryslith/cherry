@@ -2,17 +2,20 @@ use crate::github::client::Client;
 use crate::github::client::ClientError;
 use crate::github::types::{PrState as GHPrState, Repository};
 
+use std::convert::{TryFrom, TryInto};
 use std::fmt;
 use std::str::FromStr;
 
 use chrono::Utc;
 use futures::future::LocalBoxFuture;
-use quaint::ast::{Comparable, Conjuctive, Delete, Insert, Select, Update};
+use log::info;
+use quaint::ast::{Comparable, Conjuctive, Delete, Insert, ParameterizedValue, Select, Update};
 use quaint::connector::{Queryable, TransactionCapable};
 use thiserror::Error;
 
 pub mod command;
 
+#[derive(Debug, Clone, Copy)]
 enum PrState {
   Requested,
   Queued,
@@ -32,7 +35,7 @@ impl fmt::Display for PrState {
 }
 
 impl FromStr for PrState {
-  type Err = String;
+  type Err = ControllerError;
 
   fn from_str(s: &str) -> Result<Self, Self::Err> {
     match s {
@@ -40,8 +43,75 @@ impl FromStr for PrState {
       "queued" => Ok(Self::Queued),
       "merging" => Ok(Self::Merging),
       "split" => Ok(Self::Split),
-      _ => Err(s.to_string()),
+      _ => Err(ControllerError::InvalidPrState(s.to_string())),
     }
+  }
+}
+
+impl<'a> Into<ParameterizedValue<'a>> for PrState {
+  fn into(self) -> ParameterizedValue<'a> {
+    self.to_string().into()
+  }
+}
+
+impl<'a> TryFrom<&ParameterizedValue<'a>> for PrState {
+  type Error = ControllerError;
+
+  fn try_from(v: &ParameterizedValue<'a>) -> Result<Self, Self::Error> {
+    v.as_str()
+      .ok_or(ControllerError::InvalidPrState("not a string".to_string()))?
+      .parse()
+  }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MergeState {
+  Constructing,
+  Testing,
+  Success,
+  Split,
+}
+
+impl fmt::Display for MergeState {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Constructing => write!(f, "constructing"),
+      Self::Testing => write!(f, "testing"),
+      Self::Success => write!(f, "success"),
+      Self::Split => write!(f, "split"),
+    }
+  }
+}
+
+impl FromStr for MergeState {
+  type Err = ControllerError;
+
+  fn from_str(s: &str) -> Result<Self, Self::Err> {
+    match s {
+      "constructing" => Ok(Self::Constructing),
+      "testing" => Ok(Self::Testing),
+      "success" => Ok(Self::Success),
+      "split" => Ok(Self::Split),
+      _ => Err(ControllerError::InvalidMergeState(s.to_string())),
+    }
+  }
+}
+
+impl<'a> Into<ParameterizedValue<'a>> for MergeState {
+  fn into(self) -> ParameterizedValue<'a> {
+    self.to_string().into()
+  }
+}
+
+impl<'a> TryFrom<&ParameterizedValue<'a>> for MergeState {
+  type Error = ControllerError;
+
+  fn try_from(v: &ParameterizedValue<'a>) -> Result<Self, Self::Error> {
+    v.as_str()
+      .ok_or(ControllerError::InvalidMergeState(
+        "not a string".to_string(),
+      ))?
+      .parse()
   }
 }
 
@@ -51,6 +121,10 @@ pub enum ControllerError {
   Client(#[from] ClientError),
   #[error(transparent)]
   DB(#[from] quaint::error::Error),
+  #[error("invalid PR state: {0}")]
+  InvalidPrState(String),
+  #[error("invalid merge state: {0}")]
+  InvalidMergeState(String),
 }
 
 pub struct Controller<Q>
@@ -66,6 +140,7 @@ where
   Q: Queryable + TransactionCapable + 'static,
 {
   pub async fn request(&self, repo: &Repository, pr: i64) -> Result<(), ControllerError> {
+    info!("request: {} #{}", repo, pr);
     let pr_info = self.client.pr_info(repo, pr).await?;
 
     match pr_info.state {
@@ -95,7 +170,7 @@ where
           .value("repo", repo.repo.as_str())
           .value("number", pr)
           .value("commit_hash", pr_info.commit_hash)
-          .value("state", state.to_string())
+          .value("state", state)
           .value("timestamp", Utc::now().timestamp())
           .build(),
       )
@@ -113,19 +188,21 @@ where
         return Err(e.into());
       }
     }
+    info!("added {} #{} in {} state", repo, pr, state);
     if ready {
-      self.construct().await;
+      self.construct(repo).await
     } else {
       // TODO list applicable conditions
       self
         .client
         .comment_on_pr(repo, pr, "This PR cannot be merged yet.  It will be merged automatically once the following conditions are resolved:\n- PR not marked as draft")
         .await?;
+      Ok(())
     }
-    Ok(())
   }
 
   pub async fn initiate(&self, repo: &Repository, pr: i64) -> Result<(), ControllerError> {
+    info!("initiate: {} #{}", repo, pr);
     let pr_info = self.client.pr_info(repo, pr).await?;
 
     match pr_info.state {
@@ -166,7 +243,7 @@ where
       None => return Ok(()),
     };
 
-    match row["state"].as_str().unwrap().parse().unwrap() {
+    match (&row["state"]).try_into()? {
       PrState::Requested => (),
       _ => return Ok(()),
     }
@@ -182,12 +259,19 @@ where
       )
       .await?;
       tx.commit().await?;
-      todo!("report cancelled by changing commit hash");
+      self
+        .client
+        .comment_on_pr(
+          repo,
+          pr,
+          "Merge cancelled: a new commit was pushed to the PR.",
+        )
+        .await?;
     }
 
     tx.update(
       Update::table("pull_request")
-        .set("state", PrState::Queued.to_string())
+        .set("state", PrState::Queued)
         .set("timestamp", Utc::now().timestamp())
         .so_that(
           "owner"
@@ -198,10 +282,64 @@ where
     )
     .await?;
     tx.commit().await?;
+    info!("queued {} #{}", repo, pr);
     Ok(())
   }
 
-  pub async fn construct(&self) {
+  pub async fn construct(&self, repo: &Repository) -> Result<(), ControllerError> {
+    let tx = self.db.start_transaction().await?;
+    if !tx
+      .select(
+        Select::from_table("merge_attempt")
+          .so_that("owner".equals(repo.owner.as_str()))
+          .and_where("repo".equals(repo.repo.as_str()))
+          .and_where("state".not_equals(MergeState::Split)),
+      )
+      .await?
+      .is_empty()
+    {
+      info!("not constructing merge attempt because merge attempt is already in progress");
+      return Ok(());
+    }
+
+    let split_rows = tx
+      .select(
+        Select::from_table("merge_attempt")
+          .so_that("owner".equals(repo.owner.as_str()))
+          .and_where("repo".equals(repo.repo.as_str()))
+          .and_where("state".equals(MergeState::Split)),
+      )
+      .await?;
+
+    let id = if let Some(split_row) = split_rows.first() {
+      let id = split_row["id"].as_str().unwrap();
+      tx.update(
+        Update::table("merge_attempt")
+          .set("state", MergeState::Constructing)
+          .set("timestamp", Utc::now().timestamp())
+          .so_that("id".equals(id)),
+      )
+      .await?;
+      todo!("need to record the branch name??");
+      id
+    } else {
+      let id = uuid::Uuid::new_v4().to_string();
+      self
+        .db
+        .insert(
+          Insert::single_into("merge_attempt")
+            .value("id", id)
+            .value("owner", repo.owner.as_str())
+            .value("repo", repo.repo.as_str())
+            .value("state", MergeState::Constructing)
+            .value("timestamp", Utc::now().timestamp())
+            .build(),
+        )
+        .await?;
+      todo!("need to record the branch name??");
+      id.as_str()
+    };
+
     todo!()
   }
 

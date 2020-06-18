@@ -8,8 +8,7 @@
 
 # Determining approval
 
-- Require target branch = master
-  - (todo) support other target branches 
+- Require target branch to be listed in the config file
 - Limitation: Can't tell whether reviews were made for the correct target branch
 - [List all reviews](https://developer.github.com/v3/pulls/reviews/#list-reviews-on-a-pull-request)
 - Filter only reviews made for this commit #

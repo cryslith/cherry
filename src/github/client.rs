@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
 use tokio::sync::Mutex;
+use log::info;
 
 const APP_TOKEN_LIFESPAN_SECS: i64 = 10 * 60;
 const APP_TOKEN_RENEW_AHEAD_SECS: i64 = 30;
@@ -338,6 +339,7 @@ impl Client {
     pr_number: i64,
     message: &str,
   ) -> Result<(), ClientError> {
+    info!("commenting: {} #{}: {}", repo, pr_number, message);
     let uri = self
       .api()
       .path_and_query(format!("/repos/{}/issues/{}/comments", repo, pr_number).as_str())
